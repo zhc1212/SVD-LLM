@@ -1,7 +1,3 @@
-import lm_eval
-from lm_eval.models.huggingface import HFLM
-
-
 def evaluate_downstream(model, tokenizer, tasks=None, batch_size=8, device="cuda"):
     """使用 lm-evaluation-harness 评估下游任务
 
@@ -15,6 +11,9 @@ def evaluate_downstream(model, tokenizer, tasks=None, batch_size=8, device="cuda
     Returns:
         results: dict
     """
+    import lm_eval
+    from lm_eval.models.huggingface import HFLM
+
     if tasks is None:
         tasks = [
             "openbookqa",

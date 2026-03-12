@@ -1,19 +1,22 @@
 import pytest
 import torch
 from src.model.loader import load_model
-from src.data.calibration import get_calibration_data, collect_linear_input_activations
-
-MODEL_PATH = "/home/xiyaofeng/.cache/huggingface/hub/models--jeffwan--llama-7b-hf/snapshots/82eb0e6908390680598ca3ec1d77adfc5e1b24aa/"
+from src.data.calibration import (
+    get_calibration_data,
+    collect_linear_input_activations,
+    collect_layer_covariances,
+)
 
 
 @pytest.fixture(scope="module")
-def model_and_tokenizer():
-    model, tokenizer = load_model(MODEL_PATH)
+def model_and_tokenizer(model_path):
+    model, tokenizer = load_model(model_path)
     yield model, tokenizer
     del model
     torch.cuda.empty_cache()
 
 
+@pytest.mark.integration
 def test_get_calibration_data(model_and_tokenizer):
     _, tokenizer = model_and_tokenizer
     samples = get_calibration_data(tokenizer, nsamples=4, seqlen=128)
@@ -22,12 +25,27 @@ def test_get_calibration_data(model_and_tokenizer):
     assert samples[0].dtype == torch.long
 
 
-def test_collect_linear_input_activations(model_and_tokenizer):
+@pytest.mark.integration
+def test_collect_layer_covariances(model_and_tokenizer):
+    """测试流式协方差收集"""
     model, tokenizer = model_and_tokenizer
     samples = get_calibration_data(tokenizer, nsamples=2, seqlen=64)
-    X = collect_linear_input_activations(
-        model, samples, layer_idx=0, linear_name="self_attn.q_proj"
+
+    cov_dict = collect_layer_covariances(
+        model, samples, layer_idx=0,
+        linear_names=["self_attn.q_proj", "mlp.down_proj"],
     )
-    assert X.shape == (2 * 64, 4096)
-    assert X.dtype == torch.float32
-    assert not torch.isnan(X).any()
+
+    # q_proj 输入是 4096 维
+    XtX_q, N_q = cov_dict["self_attn.q_proj"]
+    assert XtX_q.shape == (4096, 4096)
+    assert N_q == 2 * 64
+
+    # down_proj 输入是 11008 维
+    XtX_d, N_d = cov_dict["mlp.down_proj"]
+    assert XtX_d.shape == (11008, 11008)
+    assert N_d == 2 * 64
+
+    # 协方差应该对称
+    C = (XtX_q / N_q).float()
+    assert torch.allclose(C, C.T, atol=1e-4)

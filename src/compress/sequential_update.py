@@ -1,7 +1,6 @@
-# src/compress/sequential_update.py
 import torch
-from src.data.calibration import collect_linear_input_activations
-from src.compress.whitening import compress_linear_whitening
+from src.data.calibration import collect_layer_covariances
+from src.compress.whitening import compress_linear_whitening_from_covariance
 from src.model.replace import replace_linear_with_compressed
 from src.model.loader import compute_rank
 
@@ -18,14 +17,23 @@ LINEAR_LAYERS_ORDER = [
 ]
 
 
+def _get_linear_module(model, layer_idx, linear_name):
+    """定位模型中指定的线性层"""
+    layer = model.model.layers[layer_idx]
+    parts = linear_name.split(".")
+    target = layer
+    for p in parts:
+        target = getattr(target, p)
+    return target
+
+
 def compress_model_sequential(model, tokenizer, calibration_data, ratio, device="cuda"):
     """SVD-LLM 完整压缩: 白化 + Sequential Update
 
-    逐层逐线性层处理:
-    1. 收集当前（更新后的）输入激活
-    2. 白化 SVD 压缩
-    3. 替换为压缩层
-    4. 继续下一个（激活会反映之前的压缩）
+    逐层处理，每层一次 forward pass 收集 7 个线性层的协方差（流式 X^T X），
+    然后压缩并替换。后续层使用更新后模型的激活。
+
+    内存: 模型本体 + 每层 7 个协方差矩阵 (~870MB) + SVD 工作区
 
     Args:
         model: HuggingFace CausalLM model
@@ -42,27 +50,25 @@ def compress_model_sequential(model, tokenizer, calibration_data, ratio, device=
     for layer_idx in range(num_layers):
         print(f"[SVD-LLM] Processing layer {layer_idx}/{num_layers - 1}...")
 
-        for linear_name in LINEAR_LAYERS_ORDER:
-            layer = model.model.layers[layer_idx]
-            parts = linear_name.split(".")
-            target = layer
-            for p in parts:
-                target = getattr(target, p)
+        # 一次 forward pass 收集当前层所有 7 个线性层的协方差
+        cov_dict = collect_layer_covariances(
+            model, calibration_data, layer_idx, LINEAR_LAYERS_ORDER, device=device
+        )
 
+        for linear_name in LINEAR_LAYERS_ORDER:
+            target = _get_linear_module(model, layer_idx, linear_name)
             weight = target.weight.data
             d, n = weight.shape
             rank = compute_rank(d, n, ratio)
 
-            # 用当前模型收集激活（反映之前层的压缩）
-            X = collect_linear_input_activations(
-                model, calibration_data, layer_idx, linear_name, device=device
-            )
+            XtX, N = cov_dict[linear_name]
+            covariance = (XtX / N).float()
 
-            A, B = compress_linear_whitening(weight.float(), X, rank)
+            A, B = compress_linear_whitening_from_covariance(weight.float(), covariance, rank)
             replace_linear_with_compressed(model, layer_idx, linear_name, A, B)
 
-            del X, A, B
-            torch.cuda.empty_cache()
+        del cov_dict
+        torch.cuda.empty_cache()
 
     return model
 
@@ -70,8 +76,10 @@ def compress_model_sequential(model, tokenizer, calibration_data, ratio, device=
 def compress_model_whitening_only(model, tokenizer, calibration_data, ratio, device="cuda"):
     """SVD-LLM(W): 仅白化，无 sequential update
 
-    用原始模型的激活一次性白化压缩所有层。
-    所有激活都来自原始未压缩模型。
+    用原始模型的激活，逐层收集协方差 → 压缩 → 存储结果。
+    全部层处理完后一次性替换，保证所有协方差来自原始模型。
+
+    内存: 模型本体 + 224 个 (A,B) 矩阵对 + 每批 7 个协方差
 
     Args:
         同 compress_model_sequential
@@ -81,38 +89,40 @@ def compress_model_whitening_only(model, tokenizer, calibration_data, ratio, dev
     """
     num_layers = model.config.num_hidden_layers
 
-    # 预收集所有激活（来自原始模型）
-    all_activations = {}
-    print("[SVD-LLM(W)] Collecting activations from original model...")
-    for layer_idx in range(num_layers):
-        for linear_name in LINEAR_LAYERS_ORDER:
-            print(f"  Layer {layer_idx}, {linear_name}")
-            X = collect_linear_input_activations(
-                model, calibration_data, layer_idx, linear_name, device=device
-            )
-            all_activations[(layer_idx, linear_name)] = X
+    # 存储所有压缩结果，最后统一替换
+    compressed_weights = {}
 
-    # 用预收集的激活压缩所有层
-    print("[SVD-LLM(W)] Compressing...")
     for layer_idx in range(num_layers):
-        print(f"  Compressing layer {layer_idx}/{num_layers - 1}...")
-        for linear_name in LINEAR_LAYERS_ORDER:
-            layer = model.model.layers[layer_idx]
-            parts = linear_name.split(".")
-            target = layer
-            for p in parts:
-                target = getattr(target, p)
+        print(f"[SVD-LLM(W)] Collecting & compressing layer {layer_idx}/{num_layers - 1}...")
 
+        # 一次 forward pass 收集当前层 7 个线性层的协方差
+        cov_dict = collect_layer_covariances(
+            model, calibration_data, layer_idx, LINEAR_LAYERS_ORDER, device=device
+        )
+
+        for linear_name in LINEAR_LAYERS_ORDER:
+            target = _get_linear_module(model, layer_idx, linear_name)
             weight = target.weight.data
             d, n = weight.shape
             rank = compute_rank(d, n, ratio)
 
-            X = all_activations[(layer_idx, linear_name)]
-            A, B = compress_linear_whitening(weight.float(), X, rank)
+            XtX, N = cov_dict[linear_name]
+            covariance = (XtX / N).float()
+
+            A, B = compress_linear_whitening_from_covariance(weight.float(), covariance, rank)
+            # 存储到 CPU 减少 GPU 内存
+            compressed_weights[(layer_idx, linear_name)] = (A.cpu(), B.cpu())
+
+        del cov_dict
+        torch.cuda.empty_cache()
+
+    # 统一替换所有层
+    print("[SVD-LLM(W)] Replacing all layers...")
+    for layer_idx in range(num_layers):
+        for linear_name in LINEAR_LAYERS_ORDER:
+            A, B = compressed_weights[(layer_idx, linear_name)]
             replace_linear_with_compressed(model, layer_idx, linear_name, A, B)
 
-            del X
-
-    del all_activations
+    del compressed_weights
     torch.cuda.empty_cache()
     return model

@@ -1,0 +1,11 @@
+[project]
+name = "svd-llm"
+version = "0.1.0"
+description = "SVD-LLM reproduction from paper"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires GPU and model weights (deselect with '-m not integration')",
+]

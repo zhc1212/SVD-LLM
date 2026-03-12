@@ -1,6 +1,11 @@
 import pytest
 import torch
-from src.compress.whitening import compute_whitening_matrix, compress_linear_whitening
+from src.compress.whitening import (
+    compute_whitening_matrix,
+    compute_whitening_matrix_from_covariance,
+    compress_linear_whitening,
+    compress_linear_whitening_from_covariance,
+)
 from src.model.loader import compute_rank
 
 
@@ -11,8 +16,20 @@ def test_whitening_matrix_shape():
     assert S.shape == (64, 64)
     assert S_inv.shape == (64, 64)
     I_approx = S @ S_inv
-    I_true = torch.eye(64)
-    assert torch.allclose(I_approx, I_true, atol=1e-4)
+    assert torch.allclose(I_approx, torch.eye(64), atol=1e-4)
+
+
+def test_whitening_from_covariance():
+    """从预计算协方差和从原始激活应该给出相同结果"""
+    torch.manual_seed(42)
+    X = torch.randn(500, 64)
+    C = X.T @ X / X.shape[0]
+
+    S1, S1_inv = compute_whitening_matrix(X)
+    S2, S2_inv = compute_whitening_matrix_from_covariance(C)
+
+    assert torch.allclose(S1, S2, atol=1e-4)
+    assert torch.allclose(S1_inv, S2_inv, atol=1e-4)
 
 
 def test_whitening_decorrelates():
@@ -25,8 +42,7 @@ def test_whitening_decorrelates():
     X_w = X @ S_inv
 
     C_w = X_w.T @ X_w / X_w.shape[0]
-    I = torch.eye(64)
-    assert torch.allclose(C_w, I, atol=0.1)
+    assert torch.allclose(C_w, torch.eye(64), atol=0.1)
 
 
 def test_compress_whitening_shape():
@@ -39,13 +55,27 @@ def test_compress_whitening_shape():
     assert B.shape == (r, 512)
 
 
+def test_compress_from_covariance_matches():
+    """从协方差和从激活压缩应该给出相同结果"""
+    torch.manual_seed(42)
+    W = torch.randn(64, 128)
+    X = torch.randn(200, 128)
+    C = X.T @ X / X.shape[0]
+    r = compute_rank(64, 128, 0.3)
+
+    A1, B1 = compress_linear_whitening(W, X, r)
+    A2, B2 = compress_linear_whitening_from_covariance(W, C, r)
+
+    assert torch.allclose(A1, A2, atol=1e-4)
+    assert torch.allclose(B1, B2, atol=1e-4)
+
+
 def test_whitening_better_than_vanilla():
     """白化 SVD 在考虑激活分布时应优于 Vanilla SVD"""
     torch.manual_seed(42)
     d, n = 128, 256
     W = torch.randn(d, n)
 
-    # 不均匀激活
     scales = torch.ones(n)
     scales[:50] = 10.0
     scales[50:] = 0.1
@@ -53,7 +83,7 @@ def test_whitening_better_than_vanilla():
 
     rank = compute_rank(d, n, 0.5)
 
-    # Vanilla SVD (直接对 W 做 SVD)
+    # Vanilla SVD
     U, S_vals, Vh = torch.linalg.svd(W, full_matrices=False)
     A_v = U[:, :rank] * S_vals[:rank].unsqueeze(0)
     B_v = Vh[:rank, :]
@@ -66,4 +96,4 @@ def test_whitening_better_than_vanilla():
     Y_whiten = X @ (A_w @ B_w).T
     err_whiten = torch.norm(Y_orig - Y_whiten) / torch.norm(Y_orig)
 
-    assert err_whiten < err_vanilla, f"Whitening error {err_whiten:.4f} should be < Vanilla error {err_vanilla:.4f}"
+    assert err_whiten < err_vanilla

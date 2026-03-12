@@ -244,16 +244,16 @@ python scripts/compress.py \
     --save_path outputs/llama7b_svdllm_20
 
 # 2. 评估 Perplexity
-python scripts/evaluate.py \
+python scripts/eval_model.py \
     --model_path outputs/llama7b_svdllm_20 \
     --eval perplexity \
     --datasets wikitext2 c4
 
 # 3. 评估下游任务
-python scripts/evaluate.py \
+python scripts/eval_model.py \
     --model_path outputs/llama7b_svdllm_20 \
     --eval downstream \
-    --tasks openbookqa arc_easy winogrande hellaswag piqa mathqa truthfulqa gsm8k
+    --tasks openbookqa arc_easy winogrande hellaswag piqa mathqa truthfulqa_gen gsm8k
 ```
 
 ---
