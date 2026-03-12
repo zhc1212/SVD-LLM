@@ -23,6 +23,11 @@ def compute_whitening_matrix(activations, eps=1e-6):
     C = X.T @ X / N  # (n, n)
     C += eps * torch.eye(n, device=C.device, dtype=C.dtype)
 
+    # 当样本数不足（N < n）时，协方差矩阵秩亏，需要额外正则化以确保正定
+    if N < n:
+        diag_mean = C.diagonal().mean().item()
+        C += diag_mean * torch.eye(n, device=C.device, dtype=C.dtype)
+
     L = torch.linalg.cholesky(C)  # 下三角
     S = L.T  # 上三角
 
