@@ -10,7 +10,6 @@
 import argparse
 import os
 import sys
-import torch
 import time
 import json
 
@@ -18,17 +17,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.model.loader import load_model
 from src.data.calibration import get_calibration_data
-from src.compress.sequential_update import (
-    compress_model_whitening_only,
-    compress_model_sequential,
-)
+from src.compress.compress_model import compress_model_whitening_only
+from src.model.replace import merge_compressed_model
 
 
 def main():
     parser = argparse.ArgumentParser(description="SVD-LLM Compression")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--method", type=str, required=True,
-                        choices=["svd_llm_w", "svd_llm"])
+                        choices=["svd_llm_w"])
     parser.add_argument("--ratio", type=float, required=True,
                         help="Compression ratio (0.0-1.0)")
     parser.add_argument("--save_path", type=str, required=True)
@@ -39,7 +36,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    print(f"=== SVD-LLM Compression ===")
+    print("=== SVD-LLM Compression ===")
     print(f"Method: {args.method}")
     print(f"Ratio: {args.ratio}")
     print(f"Model: {args.model_path}")
@@ -59,13 +56,12 @@ def main():
         model = compress_model_whitening_only(
             model, tokenizer, calibration_data, args.ratio, args.device
         )
-    elif args.method == "svd_llm":
-        model = compress_model_sequential(
-            model, tokenizer, calibration_data, args.ratio, args.device
-        )
 
     elapsed = time.time() - start_time
     print(f"Compression done in {elapsed:.1f}s")
+
+    # 合并 CompressedLinear → nn.Linear, 确保 save/load 兼容
+    merge_compressed_model(model)
 
     print(f"Saving to {args.save_path}...")
     os.makedirs(args.save_path, exist_ok=True)

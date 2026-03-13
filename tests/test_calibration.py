@@ -3,7 +3,6 @@ import torch
 from src.model.loader import load_model
 from src.data.calibration import (
     get_calibration_data,
-    collect_linear_input_activations,
     collect_layer_covariances,
 )
 

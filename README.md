@@ -13,39 +13,236 @@
 
 ## 方法概述
 
-SVD-LLM 是一种基于 SVD 的 LLM 后训练压缩方法，解决了现有方法的两个关键问题：
+SVD-LLM 是一种基于 SVD 的 LLM 后训练压缩方法，包含两个核心贡献：
+1. **Truncation-Aware Data Whitening** (§3.1) — 使截断最小奇异值等价于最小化压缩损失
+2. **Parameter Update with Sequential Low-Rank Approximation** (§3.2) — 压缩后对低秩矩阵做 LoRA 风格的顺序微调，恢复精度
 
-### 问题 1: 截断最小奇异值 ≠ 最小压缩损失
+---
 
-传统 SVD 直接对权重矩阵 W 做分解，但截断最小奇异值并不一定对应最小的输出损失，因为输入激活的分布不均匀。
+## 数学推导
 
-### 解决: Truncation-Aware Data Whitening
+### 1. 问题定义
 
-1. 收集校准数据的激活矩阵 X
-2. 通过 Cholesky 分解 XX^T = SS^T，得到白化矩阵 S
-3. 对 WS 做 SVD（而非对 W），使得：
-   - 白化后激活 S⁻¹X 各通道正交独立
-   - 截断第 i 个奇异值的损失 L_i = σ_i（直接等于奇异值本身）
-   - 因此截断最小奇异值保证最低压缩损失
+对于 Transformer 中的一个线性层 $y = Wx$，其中 $W \in \mathbb{R}^{d \times n}$，低秩压缩的目标是找到秩为 $r$ 的近似 $\hat{W}$ 使得输出误差最小：
 
-### 问题 2: 截断后无权重更新 → 高压缩率下精度严重下降
+$$\min_{\hat{W}} \mathbb{E}\left[\|Wx - \hat{W}x\|_2^2\right] = \min_{\hat{W}} \mathbb{E}\left[\|(W - \hat{W})x\|_2^2\right]$$
 
-### 解决: Sequential Low-Rank Approximation (层级参数更新)
+其中期望取自校准数据集上的激活分布。
 
-- 截断 SVD 后，逐层用新激活更新压缩后的权重
-- 补偿截断造成的误差累积
-- 高压缩率 (≥40%) 时尤为关键
+**压缩比定义:**
 
-### 数学公式
+$$R_w = 1 - \frac{(d + n) \cdot r}{d \cdot n}$$
+
+原始参数量为 $dn$，压缩后存储 $A \in \mathbb{R}^{d \times r}$ 和 $B \in \mathbb{R}^{r \times n}$，参数量为 $(d+n)r$。
+
+**LLaMA-7B 的 rank 计算示例:**
+
+| 压缩比 | 4096×4096 层的 r | 4096×11008 层的 r |
+|--------|-----------------|-------------------|
+| 20%    | 1638            | 2388              |
+| 40%    | 1228            | 1791              |
+| 60%    | 819             | 1194              |
+| 80%    | 409             | 597               |
+
+### 2. Vanilla SVD 的问题
+
+传统方法直接对 $W$ 做 SVD:
+
+$$W = U \Sigma V^T \approx U_r \Sigma_r V_r^T$$
+
+截断第 $i$ 个奇异值的输出损失为：
+
+$$L_i = \sigma_i^2 \cdot \mathbb{E}[(v_i^T x)^2]$$
+
+其中 $v_i$ 是 $V$ 的第 $i$ 列。**关键问题: $\mathbb{E}[(v_i^T x)^2]$ 与 $i$ 无关的假设不成立。** 实际的输入激活 $x$ 各维度方差差异极大（可达 100 倍），导致截断最小 $\sigma_i$ 未必对应最小 $L_i$。
+
+### 3. Truncation-Aware Data Whitening
+
+**目标:** 构造线性变换，使截断最小奇异值严格等价于最小化加权输出损失。
+
+**Step 1: 计算激活协方差**
+
+给定 $N$ 个校准样本的激活 $X \in \mathbb{R}^{N \times n}$（这里的每个线性子层有独立的 $X$），计算协方差矩阵：
+
+$$C = \frac{1}{N} X^T X \in \mathbb{R}^{n \times n}$$
+
+**实现细节:** $N$ 可达 $256 \times 2048 = 524288$，不可能存储完整激活矩阵。用 forward hook 流式累加 $X^T X$：
 
 ```
-压缩比定义: R_w = 1 - (d + n) * r / (d * n)
-  其中 W ∈ R^{d×n}, r 为保留的秩
+for each calibration batch B_t (batch_size=4):
+    X^T X += B_t^T B_t     (在 GPU 上以 float32 累加，最终转 CPU float64)
+    N += len(B_t)
+C = X^T X / N
+```
 
-白化: SS^T = XX^T  (Cholesky 分解)
-SVD:  WS = UΣV^T
-截断: 保留前 r 个最大奇异值
-恢复: W_compressed = U_r Σ_r V_r^T S^{-1}
+> **注:** 采用 GPU float32 累加而非 CPU float64，通过减少 GPU↔CPU 同步次数提速约 7 倍。
+> 协方差矩阵为 $n \times n$ 对称矩阵，32 层 × 7 子层同时累加约占 27GB GPU 显存。
+
+**Step 2: Cholesky 分解**
+
+对协方差矩阵做 Cholesky 分解：
+
+$$C = L L^T$$
+
+其中 $L \in \mathbb{R}^{n \times n}$ 是下三角矩阵。定义白化变换 $z = L^{-1}x$，验证白化性质：
+
+$$\mathbb{E}[zz^T] = L^{-1} \mathbb{E}[xx^T] L^{-T} = L^{-1} C L^{-T} = L^{-1} L L^T L^{-T} = I$$
+
+即白化后的激活 $z$ 各维度不相关且方差为 1。
+
+> **注:** 当 $N < n$ 或 $C$ 近似秩亏时 Cholesky 会失败。此时加正则化 $C \leftarrow C + \epsilon I$（代码中 $\epsilon = 10^{-6}$，秩亏时追加 $\frac{\text{tr}(C)}{n} \cdot I$）。
+
+**Step 3: 在白化空间做 SVD**
+
+由于 $x = Lz$，输出 $y = Wx = (WL)z$。对 $WL$（而非 $W$）做 SVD：
+
+$$WL = U \Sigma V^T$$
+
+截断第 $i$ 个奇异值的**输出损失**为：
+
+$$\mathcal{L}_i = \sigma_i^2 \cdot \mathbb{E}[(v_i^T z)^2] = \sigma_i^2 \cdot v_i^T \underbrace{\mathbb{E}[zz^T]}_{= I} v_i = \sigma_i^2 \cdot \underbrace{\|v_i\|^2}_{= 1} = \sigma_i^2$$
+
+**因为白化后 $\mathbb{E}[zz^T] = I$，且 $V$ 正交（$\|v_i\| = 1$），所以每个奇异值的损失贡献恰好是 $\sigma_i^2$。** 截断最小奇异值严格保证最小输出损失。
+
+这也等价于加权 Frobenius 范数的最优低秩逼近：
+
+$$\mathbb{E}[\|(W - \hat{W})x\|^2] = \|(W - \hat{W})L\|_F^2 = \sum_{i > r} \sigma_i^2$$
+
+**Step 4: 截断并分解为两个低秩矩阵**
+
+保留前 $r$ 个最大奇异值后：
+
+$$WL \approx U_r \Sigma_r V_r^T$$
+
+$$W \approx U_r \Sigma_r V_r^T L^{-1}$$
+
+论文将 $\Sigma_r$ **对称分配**到两侧（便于后续 LoRA 微调时两个矩阵尺度一致）：
+
+$$W'_u = U_r \Sigma_r^{1/2} \in \mathbb{R}^{d \times r}, \quad W'_v = \Sigma_r^{1/2} V_r^T L^{-1} \in \mathbb{R}^{r \times n}$$
+
+使得 $W \approx W'_u W'_v$，原始线性层 $y = Wx$ 替换为 $y = W'_u(W'_v x)$。
+
+> **注:** 等价的非对称分配 $A = U_r \Sigma_r, B = V_r^T L^{-1}$ 在数学上等价，但对称分配是论文的默认实现，对后续 LoRA 微调更友好。
+
+> **注 (记号约定):** 本实现采用 row-major 样本组织（$X \in \mathbb{R}^{N \times n}$），协方差写作 $C = X^T X / N$。论文正文中部分地方使用 $XX^T$ convention，仅是记号差异。
+
+**代码中的变量对应关系:**
+
+| 数学符号 | 代码变量 | 说明 |
+|---------|---------|------|
+| $L$ | `L = torch.linalg.cholesky(C)` | 下三角 Cholesky 因子 |
+| $L^T$ | `S = L.T` | 上三角，代码命名为 S |
+| $WL$ | `WS = W @ S.T` | $S.T = (L^T)^T = L$ |
+| $V_r^T L^{-1}$ | `Vh_r @ S_inv.T` | $S^{-1} = L^{-T}$，$S^{-T} = L^{-1}$ |
+
+### 4. Parameter Update with Sequential Low-Rank Approximation
+
+白化 + SVD 截断解决了「用最少的秩保留最多信息」的问题（**阶段 A: 压缩**），但截断不可避免地引入误差。论文的第二个核心贡献是在压缩后对低秩矩阵做 LoRA 风格的参数微调来恢复精度（**阶段 B: 参数更新**）。
+
+**关键: "Sequential" 指的是微调两个低秩矩阵的顺序，不是逐层压缩的顺序。**
+
+**阶段 A — 压缩 (Whitening + SVD Truncation):**
+
+对所有线性子层执行白化 SVD，得到低秩分解 $W \approx W'_u W'_v$，替换模型中所有线性层。这一步 SVD-LLM(W) 和 SVD-LLM 完全相同。
+
+**阶段 B — 参数更新 (Sequential LoRA Fine-tuning):**
+
+在压缩后的模型 $M'$ 上，使用 Alpaca 50K 数据集做两阶段顺序 LoRA 微调：
+
+```
+Stage 1: LoRA_u(M')
+  - 冻结所有 W'_v
+  - 对所有 W'_u 添加 LoRA adapter 并微调
+  - 合并 LoRA → 得到更新后的 W'_u
+
+Stage 2: LoRA_v(M'_u)
+  - 冻结更新后的 W'_u
+  - 对所有 W'_v 添加 LoRA adapter 并微调
+  - 合并 LoRA → 得到更新后的 W'_v
+```
+
+两阶段更新的直觉：同时更新 $W'_u$ 和 $W'_v$ 是一个双线性优化问题（非凸），固定一个更新另一个则是凸问题，交替优化更稳定。
+
+**SVD-LLM(W) 与 SVD-LLM 的区别:**
+
+| | SVD-LLM(W) | SVD-LLM |
+|---|---|---|
+| 阶段 A (压缩) | 白化 + SVD 截断 | 白化 + SVD 截断 (相同) |
+| 阶段 B (参数更新) | **无** | Sequential LoRA (Alpaca 50K) |
+| 校准数据 | WikiText-2 256 samples | WikiText-2 256 samples |
+| 微调数据 | 不需要 | **Alpaca 50K** (yahma/alpaca-cleaned) |
+
+SVD-LLM(W) 的压缩流程：
+
+```
+注册 hooks 到所有 32 层 × 7 个线性子层 (共 224 个 hooks)
+跑 256 次 forward pass → 一次性得到所有协方差
+for layer l = 0, 1, ..., L-1:
+    对每个线性子层: 白化 SVD → 得到 (W'_u, W'_v) → 暂存到磁盘
+统一替换所有层 → 直接评估
+```
+
+SVD-LLM 的完整流程：
+
+```
+阶段 A: 同 SVD-LLM(W)，得到压缩后模型 M'
+阶段 B:
+  Stage 1: 冻结 W'_v, 用 Alpaca 50K LoRA 微调所有 W'_u → M'_u
+  Stage 2: 冻结 W'_u, 用 Alpaca 50K LoRA 微调所有 W'_v → M'_final
+评估 M'_final
+```
+
+### 5. CompressedLinear 实现
+
+原始线性层 $y = Wx + b$ 替换为两个连续线性层：
+
+```
+x ∈ R^n  →  [Linear(n→r, no bias)]  →  z ∈ R^r  →  [Linear(r→d, bias)]  →  y ∈ R^d
+             权重 = W'_v                           权重 = W'_u, bias = b_original
+```
+
+参数量: $dn + d$ → $(n \cdot r) + (r \cdot d + d) = (n+d)r + d$
+
+在阶段 B 的 LoRA 微调中，LoRA adapter 分别加在 $W'_u$ 和 $W'_v$ 上。
+
+### 6. 算法伪代码总结
+
+```
+Algorithm 1: SVD-LLM 压缩 (应用于每个线性子层独立)
+
+Input:  模型 M, 校准数据 D_calib (256 WikiText-2 samples), 压缩比 R_w
+Output: 压缩后模型 M'
+
+--- 阶段 A: Whitening + SVD Truncation (SVD-LLM(W) 和 SVD-LLM 共用) ---
+1. 对每个线性子层 W ∈ R^{d×n}, 计算目标秩:
+     r = max(1, ⌊(1 - R_w) · d · n / (d + n)⌋)
+2. 注册 hooks 到所有 L×7 = 224 个线性子层
+3. for each calibration sample x ∈ D_calib:
+4.     前向传播 M(x), hooks 流式累加 X^T X
+5. for each layer l, for each sub-layer:
+6.     C = X^T X / N
+7.     L = cholesky(C)
+8.     U, Σ, V^T = svd(W · L)
+9.     W'_u = U_r · Σ_r^{1/2}           # 对称分配奇异值
+10.    W'_v = Σ_r^{1/2} · V_r^T · L^{-1}
+11.    替换为 CompressedLinear(W'_u, W'_v)
+→ 得到 M' (SVD-LLM(W) 到此结束)
+
+Algorithm 2: Sequential Low-Rank Approximation (仅 SVD-LLM)
+
+Input:  压缩后模型 M', 微调数据 D_ft (Alpaca 50K)
+Output: 参数更新后模型 M'_final
+
+--- 阶段 B: Sequential LoRA Fine-tuning ---
+Stage 1: LoRA_u
+12. 冻结 M' 中所有 W'_v
+13. 对所有 W'_u 添加 LoRA adapter
+14. 用 D_ft 微调 → 合并 LoRA → 得到 M'_u
+
+Stage 2: LoRA_v
+15. 冻结 M'_u 中所有 W'_u
+16. 对所有 W'_v 添加 LoRA adapter
+17. 用 D_ft 微调 → 合并 LoRA → 得到 M'_final
 ```
 
 ---
@@ -67,15 +264,12 @@ SVD:  WS = UΣV^T
 | 60% | 5.35GB | 移除 60% 参数 |
 | 80% | 2.58GB | 移除 80% 参数 |
 
-### 对比方法 (Baselines)
+### 复现方法
 
-| 方法 | 说明 |
-|------|------|
-| **SVD** (Vanilla) | 直接对 W 做 SVD 截断，无任何处理 |
-| **FWSVD** | Fisher-Weighted SVD，用 Fisher 信息加权 |
-| **ASVD** | Activation-aware SVD，用激活缩放 |
-| **SVD-LLM (W)** | 仅用 truncation-aware data whitening |
-| **SVD-LLM** | whitening + sequential low-rank update |
+| 方法 | 阶段 A (压缩) | 阶段 B (微调) | 微调数据 |
+|------|-------------|-------------|---------|
+| **SVD-LLM(W)** | 白化 + SVD 截断 | 无 | 不需要 |
+| **SVD-LLM** | 白化 + SVD 截断 | Sequential LoRA | Alpaca 50K |
 
 ### 目标结果 (Table 1: LLaMA-7B)
 
@@ -109,14 +303,15 @@ SVD:  WS = UΣV^T
 
 ## 实验设置
 
-### 校准数据
+### 校准数据 (白化用)
 - **来源**: WikiText-2 训练集
-- **样本数**: 256 条
-- **用途**: 生成激活矩阵用于白化和参数更新
+- **样本数**: 256 条, seqlen=2048
+- **用途**: 收集激活协方差，计算白化矩阵
 
-### 微调数据 (用于 Sequential Update)
+### 微调数据 (参数更新用, 仅 SVD-LLM)
 - **来源**: Alpaca 数据集 (yahma/alpaca-cleaned)
 - **样本数**: 50K
+- **用途**: Sequential LoRA 微调 W'_u 和 W'_v
 
 ### 评估数据集 (10 个)
 
@@ -150,44 +345,42 @@ SVD:  WS = UΣV^T
 
 ---
 
-## 实验流程
+## 复现计划
+
+分阶段进行，先保证 SVD-LLM(W) 结果可复现，再实现完整 SVD-LLM。
+
+### Phase 1: SVD-LLM(W) — 仅白化压缩 (不需要 Alpaca)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    实验总流程                                  │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Phase 1: 环境与数据准备                                      │
-│  ├── 安装依赖 (torch, transformers, datasets, lm-eval)       │
-│  ├── 验证 LLaMA-7B 模型加载                                   │
-│  └── 准备校准数据 (256 samples from WikiText-2)               │
-│                                                             │
-│  Phase 2: 实现 Baseline 方法                                  │
-│  ├── Vanilla SVD 压缩                                        │
-│  ├── FWSVD (Fisher-Weighted SVD)                             │
-│  └── ASVD (Activation-aware SVD)                             │
-│                                                             │
-│  Phase 3: 实现 SVD-LLM 核心算法                               │
-│  ├── Step 1: Truncation-Aware Data Whitening                 │
-│  │   ├── 收集激活 X                                          │
-│  │   ├── 计算 XX^T                                           │
-│  │   ├── Cholesky 分解得到 S                                  │
-│  │   └── 对 WS 做 SVD 并截断                                  │
-│  ├── Step 2: Sequential Low-Rank Approximation               │
-│  │   ├── 逐层更新压缩后权重                                    │
-│  │   └── 用新激活补偿截断误差                                   │
-│  └── (可选) Step 3: LoRA 微调                                 │
-│                                                             │
-│  Phase 4: 评估                                               │
-│  ├── WikiText-2 / C4 Perplexity                              │
-│  ├── 6 个分类任务 Accuracy                                    │
-│  ├── TruthfulQA / GSM8K                                      │
-│  └── 推理速度测试                                              │
-│                                                             │
-│  Phase 5: 结果对比                                            │
-│  └── 对比 Table 1 数据，分析复现差距                             │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+1. 评估原始模型 → WikiText-2 PPL, C4 PPL
+
+2. SVD-LLM(W) × 4 ratios (20%, 40%, 60%, 80%)
+   每个 ratio:
+     ├── 加载原始模型
+     ├── 用 256 条 WikiText-2 校准样本收集所有层协方差 (一次 forward pass)
+     ├── 对每个线性子层: 白化 SVD → W'_u, W'_v → 暂存磁盘
+     ├── 统一替换所有层
+     ├── 保存压缩模型
+     └── 评估 WikiText-2 / C4 Perplexity
+
+3. 20% ratio 下游任务评估 (8 个 tasks)
+```
+
+### Phase 2: SVD-LLM — 白化压缩 + Sequential LoRA (需要 Alpaca 50K)
+
+```
+4. SVD-LLM × 4 ratios (20%, 40%, 60%, 80%)
+   每个 ratio:
+     ├── 阶段 A: 同 SVD-LLM(W) 的压缩步骤 (白化 + SVD 截断)
+     ├── 阶段 B: Sequential LoRA 微调
+     │     ├── Stage 1: 冻结 W'_v, LoRA 微调所有 W'_u (Alpaca 50K)
+     │     └── Stage 2: 冻结 W'_u, LoRA 微调所有 W'_v (Alpaca 50K)
+     ├── 合并 LoRA, 保存模型
+     └── 评估 WikiText-2 / C4 Perplexity
+
+5. 20% ratio 下游任务评估
+
+6. 汇总结果对比 Table 1
 ```
 
 ---
@@ -196,34 +389,37 @@ SVD:  WS = UΣV^T
 
 ```
 SVD_LLM/
-├── README.md                    # 本文件
-├── requirements.txt             # 依赖
-├── docs/
-│   └── plans/                   # 实现计划
+├── README.md
+├── pyproject.toml
+├── .gitignore
+├── docs/plans/
 ├── src/
 │   ├── data/
-│   │   ├── calibration.py       # 校准数据加载与激活收集
-│   │   └── evaluation.py        # 评估数据加载
+│   │   └── calibration.py          # 校准数据加载 + 流式协方差收集
 │   ├── compress/
-│   │   ├── svd_vanilla.py       # Vanilla SVD baseline
-│   │   ├── fwsvd.py             # FWSVD baseline
-│   │   ├── asvd.py              # ASVD baseline
-│   │   ├── whitening.py         # Truncation-aware data whitening
-│   │   ├── svd_truncate.py      # SVD 截断核心逻辑
-│   │   └── sequential_update.py # Sequential low-rank approximation
+│   │   ├── whitening.py            # 白化矩阵 + 白化 SVD 压缩 (阶段 A)
+│   │   └── compress_model.py       # SVD-LLM(W) 完整压缩流程
+│   ├── finetune/                   # [计划中] Sequential LoRA 微调 (阶段 B, Phase 3)
 │   ├── model/
-│   │   ├── loader.py            # 模型加载与保存
-│   │   └── replace.py           # 替换原始层为压缩层
+│   │   ├── loader.py               # 模型加载、rank 计算
+│   │   └── replace.py              # CompressedLinear + 层替换
 │   └── eval/
-│       ├── perplexity.py        # Perplexity 评估
-│       └── downstream.py        # 下游任务评估 (lm-eval-harness)
+│       ├── perplexity.py           # WikiText-2 / C4 Perplexity 评估
+│       └── downstream.py           # 下游任务评估 (lm-eval-harness)
 ├── scripts/
-│   ├── compress.py              # 主压缩脚本
-│   └── evaluate.py              # 主评估脚本
-└── tests/
-    ├── test_whitening.py        # 白化正确性测试
-    ├── test_svd.py              # SVD 截断测试
-    └── test_compress.py         # 端到端压缩测试
+│   ├── compress.py                 # 压缩主脚本 (阶段 A)
+│   ├── eval_model.py               # 评估主脚本
+│   ├── run_experiments_gpu2.sh     # 实验运行脚本
+│   └── collect_results.py          # 收集结果生成对比表
+├── tests/
+│   ├── conftest.py
+│   ├── test_whitening.py
+│   ├── test_calibration.py
+│   ├── test_replace.py
+│   ├── test_perplexity.py
+│   ├── test_downstream.py
+│   └── test_e2e.py
+└── outputs/                        # 实验结果 (gitignored)
 ```
 
 ---
@@ -234,24 +430,27 @@ SVD_LLM/
 # 0. 激活环境
 source /home/xiyaofeng/ENTER/etc/profile.d/conda.sh && conda activate compactifai
 
-# 1. 压缩模型 (SVD-LLM, 20% 压缩比)
+# 1. 阶段 A: 白化 SVD 压缩 (SVD-LLM(W), 20% 压缩比)
 python scripts/compress.py \
     --model_path /home/xiyaofeng/.cache/huggingface/hub/models--jeffwan--llama-7b-hf/snapshots/82eb0e6908390680598ca3ec1d77adfc5e1b24aa/ \
-    --method svd_llm \
+    --method svd_llm_w \
     --ratio 0.2 \
-    --calib_dataset wikitext2 \
-    --calib_nsamples 256 \
-    --save_path outputs/llama7b_svdllm_20
+    --save_path outputs/llama7b_svd_llm_w_20
 
-# 2. 评估 Perplexity
+# 2. (可选) 阶段 B: Sequential LoRA 微调 → 完整 SVD-LLM
+python scripts/finetune.py \
+    --model_path outputs/llama7b_svd_llm_w_20 \
+    --save_path outputs/llama7b_svd_llm_20
+
+# 3. 评估 Perplexity
 python scripts/eval_model.py \
-    --model_path outputs/llama7b_svdllm_20 \
+    --model_path outputs/llama7b_svd_llm_w_20 \
     --eval perplexity \
     --datasets wikitext2 c4
 
-# 3. 评估下游任务
+# 4. 评估下游任务
 python scripts/eval_model.py \
-    --model_path outputs/llama7b_svdllm_20 \
+    --model_path outputs/llama7b_svd_llm_w_20 \
     --eval downstream \
     --tasks openbookqa arc_easy winogrande hellaswag piqa mathqa truthfulqa_gen gsm8k
 ```

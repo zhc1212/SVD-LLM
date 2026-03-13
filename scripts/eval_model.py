@@ -34,7 +34,7 @@ def main():
     parser.add_argument("--output_file", type=str, default=None)
     args = parser.parse_args()
 
-    print(f"=== SVD-LLM Evaluation ===")
+    print("=== SVD-LLM Evaluation ===")
     print(f"Model: {args.model_path}")
 
     model, tokenizer = load_model(args.model_path, device_map="auto")

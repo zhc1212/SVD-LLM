@@ -1,6 +1,3 @@
-import pytest
-
-
 def test_format_downstream_results():
     """测试结果格式化"""
     from src.eval.downstream import format_downstream_results

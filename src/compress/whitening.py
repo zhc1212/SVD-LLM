@@ -58,11 +58,13 @@ def compute_whitening_matrix(activations, eps=1e-6):
 def compress_linear_whitening_from_covariance(weight, covariance, rank, eps=1e-6):
     """SVD-LLM 白化压缩（从预计算协方差）
 
-    1. 从协方差计算白化矩阵 S
-    2. WS^T — 在白化空间中的权重
-    3. SVD 截断
-    4. 恢复: W_hat = U_r Σ_r V_r^T @ S^{-T}
-    5. 分解为 A @ B
+    1. 从协方差计算白化矩阵: C = LL^T, S = L^T
+    2. WL = W @ S^T — 在白化空间中的权重
+    3. SVD(WL) = UΣV^T, 截断保留前 r 个
+    4. 对称分配奇异值:
+       W'_u = U_r · Σ_r^{1/2}   (d × r)
+       W'_v = Σ_r^{1/2} · V_r^T · L^{-1}   (r × n)
+    5. W ≈ W'_u @ W'_v
 
     Args:
         weight: tensor (d, n)
@@ -71,22 +73,24 @@ def compress_linear_whitening_from_covariance(weight, covariance, rank, eps=1e-6
         eps: Cholesky 正则化
 
     Returns:
-        A: tensor (d, r)
-        B: tensor (r, n)
+        A: tensor (d, r) — W'_u = U_r · Σ_r^{1/2}
+        B: tensor (r, n) — W'_v = Σ_r^{1/2} · V_r^T · L^{-1}
     """
     W = weight.float()
 
     S, S_inv = compute_whitening_matrix_from_covariance(covariance.to(W.device), eps=eps)
 
-    WS = W @ S.T
+    WS = W @ S.T  # W @ L (since S = L^T, S.T = L)
 
     U, Sigma, Vh = torch.linalg.svd(WS, full_matrices=False)
     U_r = U[:, :rank]
     Sigma_r = Sigma[:rank]
     Vh_r = Vh[:rank, :]
 
-    A = U_r * Sigma_r.unsqueeze(0)
-    B = Vh_r @ S_inv.T
+    # 对称分配: Σ^{1/2} 到两侧
+    sqrt_sigma = torch.sqrt(Sigma_r)
+    A = U_r * sqrt_sigma.unsqueeze(0)            # W'_u = U_r · Σ_r^{1/2}
+    B = sqrt_sigma.unsqueeze(1) * (Vh_r @ S_inv.T)  # W'_v = Σ_r^{1/2} · V_r^T · L^{-1}
 
     return A, B
 

@@ -1,10 +1,19 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, LlamaTokenizer
+
+
+def _load_tokenizer(model_path: str):
+    """Load tokenizer with a compatibility fallback for local LLaMA checkpoints."""
+    try:
+        return AutoTokenizer.from_pretrained(model_path, use_fast=False, legacy=True)
+    except (RecursionError, ValueError, TypeError):
+        # Fallback for environments where AutoTokenizer + local LLaMA snapshots recurse.
+        return LlamaTokenizer.from_pretrained(model_path, legacy=True)
 
 
 def load_model(model_path: str, device_map: str = "auto", dtype=torch.float16):
     """加载 HuggingFace 模型，返回 (model, tokenizer)"""
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+    tokenizer = _load_tokenizer(model_path)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=dtype,

@@ -41,7 +41,7 @@ def main():
     if os.path.exists(orig_path):
         with open(orig_path) as f:
             orig = json.load(f)
-        print(f"\nOriginal Model:")
+        print("\nOriginal Model:")
         print(f"  WikiText-2: {fmt(orig.get('ppl_wikitext2', 'N/A'))}  (paper: 5.68)")
         print(f"  C4:         {fmt(orig.get('ppl_c4', 'N/A'))}  (paper: 7.34)")
 

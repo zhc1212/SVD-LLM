@@ -4,7 +4,7 @@ import torch
 
 def test_linear_layers_order():
     """验证线性层顺序列表"""
-    from src.compress.sequential_update import LINEAR_LAYERS_ORDER
+    from src.compress.compress_model import LINEAR_LAYERS_ORDER
     assert len(LINEAR_LAYERS_ORDER) == 7
     assert "self_attn.q_proj" in LINEAR_LAYERS_ORDER
     assert "mlp.down_proj" in LINEAR_LAYERS_ORDER
@@ -15,7 +15,7 @@ def test_compress_model_whitening_only_smoke(model_path):
     """SVD-LLM(W) smoke test: 仅压缩前 2 层"""
     from src.model.loader import load_model
     from src.data.calibration import get_calibration_data
-    from src.compress.sequential_update import compress_model_whitening_only
+    from src.compress.compress_model import compress_model_whitening_only
     from src.model.replace import CompressedLinear
 
     model, tokenizer = load_model(model_path)

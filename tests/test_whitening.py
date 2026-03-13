@@ -1,4 +1,3 @@
-import pytest
 import torch
 from src.compress.whitening import (
     compute_whitening_matrix,

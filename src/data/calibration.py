@@ -47,30 +47,51 @@ def _get_linear_module(model, layer_idx, linear_name):
     return target
 
 
-def collect_layer_covariances(model, calibration_data, layer_idx, linear_names, device="cuda"):
-    """收集一个 transformer 层中多个线性层的输入协方差矩阵（流式累加）
+class _EarlyExitException(Exception):
+    """用于 early exit forward pass 的异常"""
+    pass
 
-    不存储原始激活，只累加 X^T X 和样本计数。
-    一次 forward pass 同时收集所有指定线性层的协方差。
 
-    内存占用: 每个线性层一个 n×n 矩阵（n=in_features）
-    - 4096×4096 = 64MB per layer (q/k/v/o/gate/up)
-    - 11008×11008 = 485MB per layer (down)
-    - 一个 transformer 层 7 个线性层共 ~870MB
+def _make_xtx_hook(accumulators, acc_key, device):
+    """创建累加 X^T X 的 forward hook (在 GPU 上累加 float32，减少同步)"""
+    def hook_fn(module, input, output):
+        inp = input[0].detach().float()  # (batch, seqlen, n) on GPU
+        x = inp.reshape(-1, inp.shape[-1])  # (batch*seqlen, n)
+        xtx = x.T @ x  # (n, n) 在 GPU 上计算，留在 GPU
+        accumulators[acc_key]["XtX"] += xtx
+        accumulators[acc_key]["N"] += x.shape[0]
+    return hook_fn
+
+
+def _batch_samples(calibration_data, batch_size):
+    """将 (1, seqlen) 样本打包成 (batch_size, seqlen) 批次"""
+    batches = []
+    for i in range(0, len(calibration_data), batch_size):
+        batch = torch.cat(calibration_data[i:i + batch_size], dim=0)
+        batches.append(batch)
+    return batches
+
+
+def collect_layer_covariances(model, calibration_data, layer_idx, linear_names,
+                               device="cuda", batch_size=8):
+    """收集一个 transformer 层中多个线性层的输入协方差矩阵
+
+    优化:
+    - 批量 forward pass (batch_size=8, forward 次数从 256→32)
+    - X^T X 在 GPU 上以 float32 累加，最后一次性搬到 CPU 转 float64
+    - Early exit: forward pass 到目标层之后立即停止，不跑后续层
 
     Args:
         model: HuggingFace CausalLM model
         calibration_data: list of (1, seqlen) tensors
         layer_idx: transformer 层索引
-        linear_names: list of str, 如 ["self_attn.q_proj", "mlp.gate_proj"]
+        linear_names: list of str
         device: 计算设备
+        batch_size: 每次 forward pass 的样本数
 
     Returns:
         covariances: dict {linear_name: (XtX, N)}
-            XtX: tensor (n, n) — 累加的 X^T X
-            N: int — 累加的样本数（token 数）
     """
-    # 初始化累加器
     accumulators = {}
     handles = []
 
@@ -79,35 +100,108 @@ def collect_layer_covariances(model, calibration_data, layer_idx, linear_names, 
         in_features = target.in_features if hasattr(target, 'in_features') else target.weight.shape[1]
 
         accumulators[name] = {
-            "XtX": torch.zeros(in_features, in_features, dtype=torch.float64, device="cpu"),
+            "XtX": torch.zeros(in_features, in_features, dtype=torch.float32, device=device),
             "N": 0,
         }
-
-        def make_hook(acc_name):
-            def hook_fn(module, input, output):
-                inp = input[0].detach().float()  # (batch, seqlen, n)
-                x = inp.reshape(-1, inp.shape[-1])  # (batch*seqlen, n)
-                # 累加到 CPU，避免 GPU 内存压力
-                xtx = (x.T @ x).to(torch.float64).cpu()
-                accumulators[acc_name]["XtX"] += xtx
-                accumulators[acc_name]["N"] += x.shape[0]
-            return hook_fn
-
-        handle = target.register_forward_hook(make_hook(name))
+        handle = target.register_forward_hook(_make_xtx_hook(accumulators, name, device))
         handles.append(handle)
 
-    # 前向传播收集
+    # Early exit hook: 在目标层之后的层停止 forward pass
+    # 处理第 l 层时只跑 0..l，跳过 l+1..31，平均省 50% forward 计算
+    early_exit_handle = None
+    num_layers = model.config.num_hidden_layers
+    if layer_idx < num_layers - 1:
+        next_layer = model.model.layers[layer_idx + 1]
+        def _early_exit_pre_hook(module, args):
+            raise _EarlyExitException()
+        early_exit_handle = next_layer.register_forward_pre_hook(_early_exit_pre_hook)
+
+    # 批量 forward pass
+    batches = _batch_samples(calibration_data, batch_size)
     with torch.no_grad():
-        for sample in calibration_data:
-            sample = sample.to(device)
-            model(sample)
+        for i, batch in enumerate(batches):
+            batch = batch.to(device)
+            try:
+                model(batch)
+            except _EarlyExitException:
+                pass  # 预期行为: 到目标层后停止
+            if (i + 1) % 4 == 0 or i == len(batches) - 1:
+                print(f"    Calibration: {(i+1)*batch_size}/{len(calibration_data)}")
 
     # 移除 hooks
     for h in handles:
         h.remove()
+    if early_exit_handle is not None:
+        early_exit_handle.remove()
 
-    # 返回 (XtX, N)
-    return {name: (acc["XtX"], acc["N"]) for name, acc in accumulators.items()}
+    # GPU float32 → CPU float64
+    result = {}
+    for name, acc in accumulators.items():
+        result[name] = (acc["XtX"].to(torch.float64).cpu(), acc["N"])
+        del acc["XtX"]
+    torch.cuda.empty_cache()
+
+    return result
+
+
+def collect_all_layers_covariances(model, calibration_data, num_layers, linear_names,
+                                    device="cuda", batch_size=4):
+    """一次 forward pass 收集所有 transformer 层所有线性层的协方差
+
+    适用于 SVD-LLM(W): 模型不更新，所有层可一次性收集。
+    X^T X 在 GPU 上以 float32 累加。
+
+    内存占用 (LLaMA-7B, float32 on GPU):
+    - 6 linears × 32 layers × 4096² × 4 bytes = ~12GB
+    - 1 linear × 32 layers × 11008² × 4 bytes = ~15GB
+    - 总计 ~27GB GPU RAM (float32, 最后转 float64 到 CPU)
+
+    Args:
+        model: HuggingFace CausalLM model
+        calibration_data: list of (1, seqlen) tensors
+        num_layers: transformer 层数
+        linear_names: list of str
+        device: 计算设备
+        batch_size: 每次 forward pass 的样本数
+
+    Returns:
+        dict {(layer_idx, linear_name): (XtX, N)}
+    """
+    accumulators = {}
+    handles = []
+
+    for layer_idx in range(num_layers):
+        for name in linear_names:
+            key = (layer_idx, name)
+            target = _get_linear_module(model, layer_idx, name)
+            in_features = target.in_features if hasattr(target, 'in_features') else target.weight.shape[1]
+
+            accumulators[key] = {
+                "XtX": torch.zeros(in_features, in_features, dtype=torch.float32, device=device),
+                "N": 0,
+            }
+            handle = target.register_forward_hook(_make_xtx_hook(accumulators, key, device))
+            handles.append(handle)
+
+    batches = _batch_samples(calibration_data, batch_size)
+    with torch.no_grad():
+        for i, batch in enumerate(batches):
+            batch = batch.to(device)
+            model(batch)
+            if (i + 1) % 4 == 0 or i == len(batches) - 1:
+                print(f"  Calibration: {(i+1)*batch_size}/{len(calibration_data)} samples")
+
+    for h in handles:
+        h.remove()
+
+    # GPU float32 → CPU float64
+    result = {}
+    for key, acc in accumulators.items():
+        result[key] = (acc["XtX"].to(torch.float64).cpu(), acc["N"])
+        del acc["XtX"]
+    torch.cuda.empty_cache()
+
+    return result
 
 
 def collect_linear_input_activations(model, calibration_data, layer_idx,
@@ -116,16 +210,6 @@ def collect_linear_input_activations(model, calibration_data, layer_idx,
 
     WARNING: 此函数保存完整激活，大规模配置下会爆内存。
     生产代码请使用 collect_layer_covariances。
-
-    Args:
-        model: HuggingFace CausalLM model
-        calibration_data: list of (1, seqlen) tensors
-        layer_idx: transformer 层索引
-        linear_name: 如 "self_attn.q_proj"
-        device: 计算设备
-
-    Returns:
-        activations: tensor of shape (nsamples * seqlen, in_features)
     """
     target = _get_linear_module(model, layer_idx, linear_name)
     activations = []
