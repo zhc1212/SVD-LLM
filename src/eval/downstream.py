@@ -34,6 +34,19 @@ def evaluate_downstream(model, tokenizer, tasks=None, batch_size=8, device="cuda
 
     task_manager = TaskManager(include_path=LM_EVAL_TASKS_DIR)
 
+    # Fix tokenizer for batch generation: jeffwan/llama-7b-hf has broken special
+    # token IDs (all mapped to 0). Correct LLaMA values: bos=1, eos=2, unk=0.
+    # Wrong eos_token_id causes CUDA indexing errors during padded batch generation.
+    if tokenizer.eos_token_id == 0 and hasattr(model, "config"):
+        tokenizer.bos_token_id = getattr(model.config, "bos_token_id", 1) or 1
+        tokenizer.eos_token_id = getattr(model.config, "eos_token_id", 2) or 2
+        tokenizer.bos_token = tokenizer.convert_ids_to_tokens(tokenizer.bos_token_id)
+        tokenizer.eos_token = tokenizer.convert_ids_to_tokens(tokenizer.eos_token_id)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
+
     lm = HFLM(
         pretrained=model,
         tokenizer=tokenizer,

@@ -19,6 +19,7 @@ def load_model(model_path: str, device_map: str = "auto", dtype=torch.float16):
         torch_dtype=dtype,
         device_map=device_map,
         low_cpu_mem_usage=True,
+        attn_implementation="eager",
     )
     model.eval()
     return model, tokenizer
