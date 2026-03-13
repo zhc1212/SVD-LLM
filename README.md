@@ -255,7 +255,7 @@ Stage 2: LoRA_v
 
 | 模型 | 原始大小 | 本地路径 |
 |------|---------|---------|
-| LLaMA-7B | 13.5GB | `/home/xiyaofeng/.cache/huggingface/hub/models--jeffwan--llama-7b-hf/snapshots/82eb0e6908390680598ca3ec1d77adfc5e1b24aa/` |
+| LLaMA-7B | 13.5GB | `jeffwan/llama-7b-hf` (HuggingFace Hub) |
 
 ### 压缩比
 
@@ -524,19 +524,17 @@ SVD_LLM/
 ## 快速开始
 
 ```bash
-# 0. 激活环境
-source /home/xiyaofeng/ENTER/etc/profile.d/conda.sh && conda activate compactifai
-
 # 1. 阶段 A: 白化 SVD 压缩 (SVD-LLM(W), 20% 压缩比)
 python scripts/compress.py \
-    --model_path /home/xiyaofeng/.cache/huggingface/hub/models--jeffwan--llama-7b-hf/snapshots/82eb0e6908390680598ca3ec1d77adfc5e1b24aa/ \
+    --model_path jeffwan/llama-7b-hf \
     --method svd_llm_w \
     --ratio 0.2 \
     --save_path outputs/llama7b_svd_llm_w_20
 
 # 2. (可选) 阶段 B: Sequential LoRA 微调 → 完整 SVD-LLM
 python scripts/finetune.py \
-    --model_path outputs/llama7b_svd_llm_w_20 \
+    --model_path jeffwan/llama-7b-hf \
+    --ratio 0.2 \
     --save_path outputs/llama7b_svd_llm_20
 
 # 3. 评估 Perplexity
