@@ -331,11 +331,11 @@ Stage 2: LoRA_v
 | WinoGrande | 0.61 | **0.664** | +0.054 |
 | HellaSwag | 0.45 | **0.437** | -0.013 |
 | PIQA | 0.71 | **0.690** | -0.020 |
-| MathQA | 0.21 | N/A | datasets 4.1.1 不兼容 |
+| MathQA | 0.21 | **0.239** | +0.029 |
 | TruthfulQA | 0.26 (BLEU) | 0.390 (MC2) | 指标不同，不可直接对比 |
-| GSM8K | 0.05 (EM) | N/A | lm_eval 生成任务 CUDA 报错 |
+| GSM8K | 0.05 (EM) | 评估中 | batch_size=64 运行中 |
 
-5 个 MC 任务与论文差异在 ±0.05 以内，属于 lm_eval 版本 / prompt 模板差异。MathQA、TruthfulQA (BLEU)、GSM8K 因 lm_eval + datasets 库兼容性问题未能评估。
+6 个 MC 任务与论文差异在 ±0.05 以内，属于 lm_eval 版本 / prompt 模板差异。MathQA 通过本地 Parquet 数据集解决了 datasets 4.1.1 兼容性问题。TruthfulQA 使用 MC2 指标（论文用 BLEU），不可直接对比。
 
 ### 全部压缩率下游任务 (复现, Accuracy ↑)
 
@@ -346,14 +346,15 @@ Stage 2: LoRA_v
 | WinoGrande | 0.664 | 0.575 | 0.527 | 0.480 |
 | HellaSwag | 0.437 | 0.330 | 0.273 | 0.260 |
 | PIQA | 0.690 | 0.609 | 0.544 | 0.523 |
+| MathQA | 0.239 | 0.220 | 0.218 | 0.205 |
 | TruthfulQA (MC2) | 0.390 | 0.433 | 0.476 | 0.501 |
 
 ### Phase 1 结论
 
 1. **PPL 复现成功** — 趋势完全一致，所有压缩率上复现值均优于论文
-2. **Downstream 基本一致** — 5 个 MC 任务与论文差异在 ±0.05 以内
+2. **Downstream 基本一致** — 6 个 MC 任务（含 MathQA）与论文差异在 ±0.05 以内
 3. **高压缩率退化明显** — 60%/80% 的 PPL 和 Accuracy 大幅退化，需要 Phase B (Sequential LoRA) 恢复质量
-4. **环境兼容性问题** — mathqa (datasets 4.1.1 移除 loading script 支持)、truthfulqa_gen / gsm8k (lm_eval 0.4.9 生成任务 CUDA 兼容问题) 无法评估，非模型问题
+4. **环境兼容性说明** — MathQA 通过本地 Parquet 数据集解决 datasets 4.1.1 兼容性问题；TruthfulQA 使用 MC2 指标替代论文的 BLEU 指标；GSM8K 评估中
 
 ---
 

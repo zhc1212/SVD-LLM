@@ -1,3 +1,9 @@
+import os
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+LM_EVAL_TASKS_DIR = os.path.join(PROJECT_ROOT, "lm_eval_tasks")
+
+
 def evaluate_downstream(model, tokenizer, tasks=None, batch_size=8, device="cuda"):
     """使用 lm-evaluation-harness 评估下游任务
 
@@ -13,6 +19,7 @@ def evaluate_downstream(model, tokenizer, tasks=None, batch_size=8, device="cuda
     """
     import lm_eval
     from lm_eval.models.huggingface import HFLM
+    from lm_eval.tasks import TaskManager
 
     if tasks is None:
         tasks = [
@@ -21,8 +28,11 @@ def evaluate_downstream(model, tokenizer, tasks=None, batch_size=8, device="cuda
             "winogrande",
             "hellaswag",
             "piqa",
+            "mathqa_local",
             "truthfulqa_mc2",
         ]
+
+    task_manager = TaskManager(include_path=LM_EVAL_TASKS_DIR)
 
     lm = HFLM(
         pretrained=model,
@@ -35,6 +45,7 @@ def evaluate_downstream(model, tokenizer, tasks=None, batch_size=8, device="cuda
         model=lm,
         tasks=tasks,
         batch_size=batch_size,
+        task_manager=task_manager,
     )
 
     return results["results"]
