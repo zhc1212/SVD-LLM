@@ -21,9 +21,7 @@ def evaluate_downstream(model, tokenizer, tasks=None, batch_size=8, device="cuda
             "winogrande",
             "hellaswag",
             "piqa",
-            "mathqa",
-            "truthfulqa_gen",
-            "gsm8k",
+            "truthfulqa_mc2",
         ]
 
     lm = HFLM(
